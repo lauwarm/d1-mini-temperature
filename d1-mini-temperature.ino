@@ -1,15 +1,16 @@
 #include <ESP8266WiFi.h>
 #include <InfluxDbClient.h>
 #include <ESP8266WiFiMulti.h>
-ESP8266WiFiMulti wifiMulti;
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <RTClib.h>
+#include <NTPClient.h>
+#include <WifiUdp.h>
 
 RTC_DS3231 rtc;
+ESP8266WiFiMulti wifiMulti;
 
 char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-
 
 #define WIFI_SSID ""
 #define WIFI_PASS ""
@@ -26,33 +27,36 @@ InfluxDBClient client(INFLUXDB_URL, INFLUXDB_DB_NAME);
 Point sensor("wifi status");
 
 //Temperature Sensor
-const int oneWireBus = 2;
+const int oneWireBus = 2; //D4
 OneWire oneWire(oneWireBus);
 DallasTemperature sensors(&oneWire);
 
+#define CLOCK_INTERRUPT_PIN 16 //D0
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
+
 void setup() {
-  Serial.begin(57600);
+  Serial.begin(9600);
   
   #ifndef ESP8266
   while (!Serial); // wait for serial port to connect. Needed for native USB
-#endif
+  #endif
 
   if (! rtc.begin()) {
     Serial.println("Couldn't find RTC");
     Serial.flush();
     while (1) delay(10);
   }
+//  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  
+  
 
   if (rtc.lostPower()) {
     Serial.println("RTC lost power, let's set the time!");
-    // When time needs to be set on a new device, or after a power loss, the
-    // following line sets the RTC to the date & time this sketch was compiled
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    // This line sets the RTC with an explicit date & time, for example to set
-    // January 21, 2014 at 3am you would call:
-    // rtc.adjust(DateTime(2014, 1, 21, 3, 0, 0));
   }
-
+  
   pinMode(LED_BUILTIN, OUTPUT); 
   digitalWrite(LED_BUILTIN, HIGH);
 
@@ -70,6 +74,12 @@ void setup() {
   Serial.print("Connected! IP: ");
   Serial.print(WiFi.localIP());
 
+  //ntp stuff and set rtc
+  timeClient.begin();
+  timeClient.setTimeOffset(0);
+  timeClient.update();
+  rtc.adjust(DateTime(timeClient.getEpochTime()));
+
   client.setConnectionParamsV1(INFLUXDB_URL, INFLUXDB_DB_NAME, INFLUXDB_USER, INFLUXDB_PASSWORD);
 
   sensor.addTag("device", DEVICE);
@@ -82,6 +92,20 @@ void setup() {
     Serial.print("InfluxDB connection failed: ");
     Serial.println(client.getLastErrorMessage());
   }
+
+  rtc.disable32K(); // RTC
+  pinMode(CLOCK_INTERRUPT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(CLOCK_INTERRUPT_PIN), onAlarm, FALLING);
+  rtc.clearAlarm(1);
+  rtc.clearAlarm(2);
+  rtc.writeSqwPinMode(DS3231_OFF);
+  rtc.disableAlarm(2);
+  if(!rtc.setAlarm1(rtc.now() + TimeSpan(10),DS3231_A1_Second)) {
+    Serial.println("Error, alarm wasn't set!");
+  }
+  else {
+    Serial.println("Alarm will happen in 10 seconds!");  
+  }
 }
 
 void loop() {
@@ -92,8 +116,52 @@ void loop() {
   //digitalWrite(LED_BUILTIN, HIGH);  // Turn the LED off by making the voltage HIGH
   //delay(2000);                      // Wait for two seconds (to demonstrate the active low LED)
 
+
+  //RTC MAGIC
+  DateTime now = rtc.now();
+  Serial.println();
+  Serial.print(now.year(), DEC);
+  Serial.print('/');
+  Serial.print(now.month(), DEC);
+  Serial.print('/');
+  Serial.print(now.day(), DEC);
+  Serial.print(" (");
+  Serial.print(daysOfTheWeek[now.dayOfTheWeek()]);
+  Serial.print(") ");
+  Serial.print(now.hour(), DEC);
+  Serial.print(':');
+  Serial.print(now.minute(), DEC);
+  Serial.print(':');
+  Serial.print(now.second(), DEC);
+  Serial.println();
+
+  Serial.print(" since midnight 1/1/1970 = ");
+  Serial.print(now.unixtime());
+  Serial.print("s = ");
+  Serial.print(now.unixtime() / 86400L);
+  Serial.println("d");
+
+  Serial.println();
+
+  Serial.print("SQW: ");
+  Serial.print(digitalRead(CLOCK_INTERRUPT_PIN));
+  Serial.print(" Alarm1: ");
+  Serial.print(rtc.alarmFired(1));
+  Serial.println();
+  
+  if(rtc.alarmFired(1)) {
+    rtc.clearAlarm(1);
+    Serial.println("Alarm cleared!");
+
+    //TEST
+      timeClient.update();
+  Serial.print("Formated Time: ");
+  Serial.print(timeClient.getFormattedTime());
+  Serial.println();
   sensors.requestTemperatures();
+  Serial.println("Wait 1s for Temperature Sensor");
   delay(1000);
+  Serial.println(sensors.getTempCByIndex(0));
   // Store measured value into point
   sensor.clearFields();
   // Report RSSI of currently connected network
@@ -111,55 +179,11 @@ void loop() {
     Serial.print("InfluxDB write failed: ");
     Serial.println(client.getLastErrorMessage());
   }
-
-  //Wait 10s
-  Serial.println("Wait 10s");
+  }
+  
   delay(9000);
+}
 
-      DateTime now = rtc.now();
-
-    Serial.print(now.year(), DEC);
-    Serial.print('/');
-    Serial.print(now.month(), DEC);
-    Serial.print('/');
-    Serial.print(now.day(), DEC);
-    Serial.print(" (");
-    Serial.print(daysOfTheWeek[now.dayOfTheWeek()]);
-    Serial.print(") ");
-    Serial.print(now.hour(), DEC);
-    Serial.print(':');
-    Serial.print(now.minute(), DEC);
-    Serial.print(':');
-    Serial.print(now.second(), DEC);
-    Serial.println();
-
-    Serial.print(" since midnight 1/1/1970 = ");
-    Serial.print(now.unixtime());
-    Serial.print("s = ");
-    Serial.print(now.unixtime() / 86400L);
-    Serial.println("d");
-
-    // calculate a date which is 7 days, 12 hours, 30 minutes, 6 seconds into the future
-    DateTime future (now + TimeSpan(7,12,30,6));
-
-    Serial.print(" now + 7d + 12h + 30m + 6s: ");
-    Serial.print(future.year(), DEC);
-    Serial.print('/');
-    Serial.print(future.month(), DEC);
-    Serial.print('/');
-    Serial.print(future.day(), DEC);
-    Serial.print(' ');
-    Serial.print(future.hour(), DEC);
-    Serial.print(':');
-    Serial.print(future.minute(), DEC);
-    Serial.print(':');
-    Serial.print(future.second(), DEC);
-    Serial.println();
-
-    Serial.print("Temperature: ");
-    Serial.print(rtc.getTemperature());
-    Serial.println(" C");
-
-    Serial.println();
-    delay(3000);
+ICACHE_RAM_ATTR void onAlarm() {
+  Serial.println("Alarm occured!");
 }
